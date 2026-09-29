@@ -4,6 +4,7 @@
 package fairsem
 
 import (
+	"container/list"
 	"context"
 	"errors"
 	"sync"
@@ -13,8 +14,14 @@ import (
 var ErrClosed = errors.New("fairsem: semaphore closed")
 
 // waiter 是一个排队中的等待者。
+//
+// 不变式：等待者要么在 queue 里（done == false），要么已经离队（done == true）
+// 且 ch 里恰好被写入一个终态值（nil 表示获得许可，否则为失败原因）。
+// ch 缓冲为 1，因此写入方永不阻塞。
 type waiter struct {
-	ready chan struct{}
+	ctx  context.Context
+	ch   chan error
+	done bool
 }
 
 // Semaphore 是容量为 n 的公平信号量，可被多个 goroutine 共用。
@@ -24,11 +31,8 @@ type Semaphore struct {
 	mu       sync.Mutex
 	acquired int
 	waiting  int
-	issued   int
 	closed   bool
-
-	queue map[*waiter]struct{}
-	wake  chan struct{}
+	queue    *list.List // 元素为 *waiter，队首即最早进入的等待者
 }
 
 // Counters 是信号量表内计数的一次快照。
@@ -45,8 +49,7 @@ func New(n int) *Semaphore {
 	}
 	return &Semaphore{
 		n:     n,
-		queue: make(map[*waiter]struct{}),
-		wake:  make(chan struct{}, 1),
+		queue: list.New(),
 	}
 }
 
@@ -62,82 +65,85 @@ func (s *Semaphore) Acquire(ctx context.Context) error {
 		return err
 	}
 
-	if s.acquired < s.n && len(s.queue) == 0 {
+	if s.acquired < s.n && s.queue.Len() == 0 {
 		s.acquired++
-		s.issued = s.acquired + s.waiting
 		s.mu.Unlock()
 		return nil
 	}
 
-	w := &waiter{ready: make(chan struct{})}
-	s.queue[w] = struct{}{}
+	w := &waiter{ctx: ctx, ch: make(chan error, 1)}
+	elem := s.queue.PushBack(w)
 	s.waiting++
-	s.issued = s.acquired + s.waiting
 	s.mu.Unlock()
 
-	for {
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-s.wake:
-			s.mu.Lock()
-			var head *waiter
-			for x := range s.queue {
-				head = x
-				break
-			}
-			if head != w {
-				s.mu.Unlock()
-				select {
-				case s.wake <- struct{}{}:
-				default:
-				}
-				continue
-			}
-			delete(s.queue, w)
-			s.waiting--
-			s.acquired++
-			s.issued = s.acquired + s.waiting
+	select {
+	case err := <-w.ch:
+		return err
+	case <-ctx.Done():
+		s.mu.Lock()
+		if w.done {
+			// 与 Release/Close 交错：终态值已经写入 ch，直接取用。
 			s.mu.Unlock()
-			return nil
+			return <-w.ch
 		}
+		// 仍在队列中：摘除自己，不占用队列位置，也不产生或消耗许可。
+		w.done = true
+		s.queue.Remove(elem)
+		s.waiting--
+		s.mu.Unlock()
+		return ctx.Err()
 	}
 }
 
-// Release 归还一个许可，并唤醒一名等待者。
+// Release 归还一个许可，并唤醒队首一名等待者。
 func (s *Semaphore) Release() {
 	s.mu.Lock()
-	if s.acquired > 0 {
-		s.acquired--
+	defer s.mu.Unlock()
+	if s.acquired == 0 {
+		return
 	}
-	only := len(s.queue) == 1
-	s.issued = s.acquired + s.waiting
-	s.mu.Unlock()
-
-	if only {
-		select {
-		case s.wake <- struct{}{}:
-		default:
+	s.acquired--
+	for s.queue.Len() > 0 {
+		w := s.queue.Remove(s.queue.Front()).(*waiter)
+		s.waiting--
+		w.done = true
+		if err := w.ctx.Err(); err != nil {
+			// 已取消的等待者不消耗许可，把许可让给下一位。
+			w.ch <- err
+			continue
 		}
+		s.acquired++
+		w.ch <- nil
+		return
 	}
 }
 
-// Close 关闭信号量：其后再进入 Acquire 的调用直接返回 ErrClosed。
+// Close 关闭信号量：唤醒全部排队中的等待者（返回 ErrClosed），
+// 其后再进入 Acquire 的调用直接返回 ErrClosed。
 // 已在持锁者仍可 Release。重复 Close 幂等。
 func (s *Semaphore) Close() {
 	s.mu.Lock()
+	defer s.mu.Unlock()
 	if s.closed {
-		s.mu.Unlock()
 		return
 	}
 	s.closed = true
-	s.mu.Unlock()
+	for e := s.queue.Front(); e != nil; e = e.Next() {
+		w := e.Value.(*waiter)
+		w.done = true
+		w.ch <- ErrClosed
+	}
+	s.queue.Init()
+	s.waiting = 0
 }
 
-// Stats 返回计数快照。
+// Stats 返回计数快照。三个计数在同一把锁下读出，且 Issued 由
+// Acquired + Waiting 现算，任意时刻都满足 Issued == Acquired + Waiting。
 func (s *Semaphore) Stats() Counters {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	return Counters{
-		Issued:   s.issued,
+		Issued:   s.acquired + s.waiting,
 		Acquired: s.acquired,
 		Waiting:  s.waiting,
 	}
